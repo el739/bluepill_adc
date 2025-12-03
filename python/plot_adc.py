@@ -233,9 +233,6 @@ dev = usb.core.find(idVendor=ID_VENDOR, idProduct=ID_PRODUCT)
 if dev is None:
     raise Exception("Device {} not found".format(DEV_DESCR))
 
-if dev.is_kernel_driver_active(0):
-    dev.detach_kernel_driver(0)
-
 configure(dev, "cmd", ADC_CMD_INV["stop"])
 
 if args.trig_t_max is not None:
@@ -299,6 +296,7 @@ if args.plot:
     plt.ylabel('V [{:.03f} V]'.format(args.vscale))
     plt.grid(True)
     plt.show()
+    #plt.savefig('waveform.png')
 
 if not args.plot or args.output is not None:
     if args.output is None:

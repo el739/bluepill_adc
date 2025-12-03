@@ -142,6 +142,7 @@ void MainWindow::setCurrentADC(libusb_device *device)
         return;
     }
 
+    #ifndef _WIN32
     if (libusb_kernel_driver_active(current_adc, 0))
     {
         if ((res = libusb_detach_kernel_driver(current_adc, 0)) != 0)
@@ -150,6 +151,7 @@ void MainWindow::setCurrentADC(libusb_device *device)
             return;
         }
     }
+    #endif
 
     if ((res = libusb_set_configuration(current_adc, 1)) != 0)
         qDebug("Error setting configuration: code = %d", res);
