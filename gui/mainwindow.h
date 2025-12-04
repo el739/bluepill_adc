@@ -8,14 +8,15 @@
 #include <QElapsedTimer>
 #include <QImage>
 #include <QMap>
+#include <QList>
+#include <QByteArray>
+#include <QAction>
 
 #include <libusb-1.0/libusb.h>
 
 #include "adc_proto.h"
-
-#define TRANSFER_COUNT      8
-#define TRANSFER_SIZE       (ADC_SAMPLES_COUNT * ADC_PACKET_SIZE * 1)
-#define TRANSFER_TIMEOUT_MS 300
+#include "adc_usb_manager.h"
+#include "plotrenderer.h"
 
 namespace Ui {
 class MainWindow;
@@ -41,21 +42,10 @@ class MainWindow : public QMainWindow
     };
 
     QTimer                  event_timer;
-    struct libusb_context * ctx;
-    libusb_device_handle  * current_adc;
-    bool                    restart_transfers;
+    AdcUsbManager         * usb_manager;
 
-    struct MemBuf
-    {
-        bool dev;
-        unsigned char * ptr;
-        unsigned int length;
-    };
-
-    QList<MemBuf>           bufs;
-    struct libusb_transfer* transfers[TRANSFER_COUNT];
-
-    int                     last_seq, seq_t0;
+    int                     last_seq;
+    int                     seq_t0;
     QElapsedTimer           statistic_timer, redraw_timer;
     qulonglong              bytes_received, packets_received,
                             samples_received, periods_received,
@@ -66,18 +56,17 @@ class MainWindow : public QMainWindow
     int                     channels_in_use;
     bool                    redraw_needed;
 
-    QImage                  plot_bgd;
+    PlotRenderer            plot_renderer;
 
     QFile                   dump;
 
     double samplePeriod(int frequency_code);
-    void setCurrentADC(libusb_device * device);
     void resetStatistics();
     void updateStatistics(int bytes, int packets, int samples, int periods, int lost);
     void updateData(int packet_num, int freq_code, const QList<int> &channels, const QList<uint16_t> &samples);
     void redrawSamples(bool force = false);
 
-    void parseADCPacket(const unsigned char * packet);
+    void parseADCPacket(const QByteArray &packet);
 
     int32_t readRegister(int reg_index0, int nbytes = 1, int tries = 3);
     void writeRegister(int reg_index0, int32_t reg_value, int nbytes = 1, int tries = 3);
@@ -85,10 +74,10 @@ class MainWindow : public QMainWindow
     void readConfig();
 
 public:
-    explicit MainWindow(struct libusb_context * ctx0, QWidget *parent = 0);
+    explicit MainWindow(AdcUsbManager *manager, QWidget *parent = nullptr);
     ~MainWindow();
 
-    void onTransfer(struct libusb_transfer * transfer);
+    void onAdcPacket(const QByteArray &packet);
 
 public slots:
     void handleUsbEvents(int timeout_ms = 0);
@@ -96,6 +85,7 @@ public slots:
     void refreshDevicesList();
     void deviceSelected(QAction *action);
     void updateChannelsSelection();
+    void onUsbError(const QString &message);
 
 private slots:
     void on_cbNBits_currentIndexChanged(int index);

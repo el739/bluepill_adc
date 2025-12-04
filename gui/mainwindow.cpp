@@ -1,10 +1,11 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 
-#include <QPainter>
 #include <QCheckBox>
-
-#include <math.h>
+#include <QDebug>
+#include <QGridLayout>
+#include <QPixmap>
+#include <QStringList>
 
 static QList<int> bits(uint16_t v)
 {
@@ -13,44 +14,6 @@ static QList<int> bits(uint16_t v)
         if (v & (1 << i))
             ret.push_back(i);
     return ret;
-}
-
-static double round_to(double value, int ndigits)
-{
-    double base = 1.0;
-    for (; ndigits > 0; ndigits--)
-        base *= 0.1;
-    for (; ndigits < 0; ndigits++)
-        base *= 10.0;
-    return round(value * base) / base;
-}
-
-static void get_scale(double vmin, double vmax, int grid_count, double *scalemin, double *scalemax, double *grid0, double *grid_step)
-{
-    *scalemin = vmin;
-    *scalemax = vmax;
-
-    double d = *scalemax - *scalemin;
-    if (d == 0)
-    {
-        *scalemin -= 0.5;
-        *scalemax += 0.5;
-    }
-
-    double step = (*scalemax - *scalemin) / (double)qMax(1, grid_count);
-    int ndigits = floor(log10(fabs(step)));
-    *grid_step = round_to(step, ndigits);
-    *grid0 = round_to(*scalemin, ndigits);
-}
-
-#ifdef __WIN32__
-static void __stdcall transfer_callback(struct libusb_transfer * transfer)
-#else
-static void transfer_callback(struct libusb_transfer * transfer)
-#endif
-{
-    MainWindow * window = (MainWindow*)transfer->user_data;
-    window->onTransfer(transfer);
 }
 
 double MainWindow::samplePeriod(int frequency_code)
@@ -101,100 +64,6 @@ double MainWindow::samplePeriod(int frequency_code)
     return ret;
 }
 
-void MainWindow::setCurrentADC(libusb_device *device)
-{
-    int res;
-
-    if (!current_adc && !device)
-        return;
-    if (current_adc && libusb_get_device(current_adc) == device)
-        return;
-    if (current_adc)
-    {
-        restart_transfers = false;
-        for (int i = 0; i < TRANSFER_COUNT; i++)
-            libusb_cancel_transfer(transfers[i]);
-        handleUsbEvents(TRANSFER_TIMEOUT_MS);
-        for (int i = 0; i < TRANSFER_COUNT; i++)
-            libusb_free_transfer(transfers[i]);
-
-        for (int i = 0; i < bufs.size(); i++)
-            if (bufs[i].dev)
-                libusb_dev_mem_free(current_adc, bufs[i].ptr, bufs[i].length);
-            else
-                free(bufs[i].ptr);
-        bufs.clear();
-
-        libusb_close(current_adc);
-        current_adc = NULL;
-    }
-
-    if (!device)
-    {
-        ui->statusBar->showMessage(tr("disconnected"));
-        return;
-    }
-
-    if ((res = libusb_open(device, &current_adc)) != 0)
-    {
-        current_adc = NULL;
-        qDebug("Error opening device: code = %d", res);
-        return;
-    }
-
-    #ifndef _WIN32
-    if (libusb_kernel_driver_active(current_adc, 0))
-    {
-        if ((res = libusb_detach_kernel_driver(current_adc, 0)) != 0)
-        {
-            qDebug("Error detaching kernel driver: code = %d", res);
-            return;
-        }
-    }
-    #endif
-
-    if ((res = libusb_set_configuration(current_adc, 1)) != 0)
-        qDebug("Error setting configuration: code = %d", res);
-    if ((res = libusb_claim_interface(current_adc, 0)) != 0)
-        qDebug("Error claiming interface: code = %d", res);
-
-    int dev_bufs = 0;
-    for (int i = 0; i < TRANSFER_COUNT; i++)
-    {
-        MemBuf buf;
-        buf.ptr = libusb_dev_mem_alloc(current_adc, TRANSFER_SIZE);
-        if (!(buf.dev = (buf.ptr != NULL)))
-            buf.ptr = (unsigned char*)calloc(1, TRANSFER_SIZE);
-        else
-            dev_bufs++;
-        buf.length = TRANSFER_SIZE;
-        bufs.append(buf);
-    }
-
-    for (int i = 0; i < TRANSFER_COUNT; i++)
-    {
-        if (!(transfers[i] = libusb_alloc_transfer(0)))
-        {
-            qDebug("Can't allocate transfer #%d", i);
-            break;
-        }
-        libusb_fill_bulk_transfer(transfers[i], current_adc, ADC_SAMPLES_EP | 0x80,
-                                  bufs[i].ptr, bufs[i].length,
-                                  transfer_callback,
-                                  (void*)this, TRANSFER_TIMEOUT_MS);
-    }
-
-    readConfig();
-
-    restart_transfers = true;
-    resetStatistics();
-    for (int i = 0; i < TRANSFER_COUNT; i++)
-    {
-        if ((res = libusb_submit_transfer(transfers[i])) != 0)
-            qDebug("Can't submit transfer %d: error code %d", i, res);
-    }
-}
-
 void MainWindow::updateStatistics(int bytes, int packets, int samples, int periods, int lost)
 {
     bytes_received += bytes;
@@ -226,112 +95,43 @@ void MainWindow::redrawSamples(bool force)
         return;
     redraw_timer.start();
 
-    int W = ui->lPlot->width(),
-        H = ui->lPlot->height();
-    QImage plot = QImage(W, H, QImage::Format_ARGB32_Premultiplied);
-
-    QPainter painter(&plot);
-    painter.fillRect(0, 0, W, H, Qt::black);
-
-    if (ts_data.size() == 0)
+    if (ts_data.isEmpty())
         return;
 
+    PlotOptions options;
     QStringList tscale_parts = ui->cbTScale->currentText().split(' ');
     double tscale = tscale_parts[0].toDouble();
-    if (tscale_parts[1] == "us")
+    if (tscale_parts.size() > 1 && tscale_parts[1] == "us")
         tscale *= 1e-6;
-    else if (tscale_parts[1] == "ms")
+    else if (tscale_parts.size() > 1 && tscale_parts[1] == "ms")
         tscale *= 1e-3;
-    double first_t = ts_data.first(), last_t = ts_data.last();
-    double tscale_offset = (double)ui->hsTOffset_GUI->value() / 1000.0 * (last_t - first_t);
-    double Tmin = first_t, Tmax = first_t + tscale, Tgrid0, Tstep;
-    get_scale(Tmin + tscale_offset, Tmax + tscale_offset, 10, &Tmin, &Tmax, &Tgrid0, &Tstep);
 
     QStringList vscale_parts = ui->cbVScale->currentText().split(' ');
     double vscale = vscale_parts[0].toDouble();
-    if (vscale_parts[1] == "uV")
+    if (vscale_parts.size() > 1 && vscale_parts[1] == "uV")
         vscale *= 1e-6;
-    else if (vscale_parts[1] == "mV")
+    else if (vscale_parts.size() > 1 && vscale_parts[1] == "mV")
         vscale *= 1e-3;
-    double vscale_offset = (double)ui->hsVOffset_GUI->value() / 1000.0 * ui->dsbVRef->value();
-    double Vmin = 0.0, Vmax = vscale, Vgrid0, Vstep;
 
-    get_scale(Vmin + vscale_offset, Vmax + vscale_offset, 10, &Vmin, &Vmax, &Vgrid0, &Vstep);
+    options.timeScaleSeconds = tscale;
+    options.timeOffsetRatio = (double)ui->hsTOffset_GUI->value() / 1000.0;
+    options.voltageScaleVolts = vscale;
+    options.voltageOffsetRatio = (double)ui->hsVOffset_GUI->value() / 1000.0;
+    options.referenceVoltage = ui->dsbVRef->value();
+    options.triggerLevelVolts = (double)ui->hsTrigLevel->value() / (double)ADC_MAX_LEVEL * options.referenceVoltage;
+    options.triggerEnabled = (ui->cbTrigger->currentIndex() > 0);
+    options.canvasSize = ui->lPlot->size();
+    options.channelColors = QVector<QColor>();
+    options.channelColors.reserve(ADC_TOTAL_CHANNELS);
+    for (int i = 0; i < ADC_TOTAL_CHANNELS; ++i)
+        options.channelColors.append(channels_color[i]);
 
-    const int margin = 15;
-
-    painter.setPen(QPen(Qt::white, 1));
-    painter.drawText(QRect(0, 0, W, H),
-                     Qt::AlignLeft | Qt::AlignTop,
-                     tr("TIME: %1 [ms] + %2  [ms/Cell];  "
-                        "V: %3 [mV] + %4  [mV/Cell]")
-                     .arg(Tgrid0 * 1000.0, 7, 'f', 3)
-                     .arg(Tstep  * 1000.0, 7, 'f', 3)
-                     .arg(Vgrid0 * 1000.0, 7, 'f', 3)
-                     .arg(Vstep  * 1000.0, 7, 'f', 3));
-
-    int minx = margin, maxx = W - margin;
-    int miny = margin, maxy = H - margin;
-
-    for (double t = Tgrid0; t <= Tmax; t += Tstep)
+    QPixmap pixmap = plot_renderer.render(ts_data, vs_data, options);
+    if (!pixmap.isNull())
     {
-        int x = minx + (maxx - minx) * (t - Tmin) / (Tmax - Tmin);
-        if (t == Tgrid0)
-            painter.setPen(QPen(Qt::lightGray, 3));
-        else
-            painter.setPen(QPen(Qt::darkGray, 1));
-        painter.drawLine(x, margin, x, H - margin);
+        ui->lPlot->setPixmap(pixmap);
+        ui->lPlot->repaint();
     }
-    for (double v = Vgrid0; v <= Vmax; v += Vstep)
-    {
-        int y = maxy - (maxy - miny) * (v - Vmin) / (Vmax - Vmin);
-        if (v == Vgrid0)
-            painter.setPen(QPen(Qt::lightGray, 3));
-        else
-            painter.setPen(QPen(Qt::darkGray, 1));
-        painter.drawLine(margin, y, W - margin, y);
-    }
-
-    {
-        double level = (double)ui->hsTrigLevel->value() / (double)ADC_MAX_LEVEL * ui->dsbVRef->value();
-        if (ui->cbTrigger->currentIndex() > 0)
-            painter.setPen(QPen(Qt::lightGray, 3, Qt::DotLine));
-        else
-            painter.setPen(QPen(Qt::darkGray, 1, Qt::DotLine));
-        int y = maxy - (maxy - miny) * (level - Vmin) / (Vmax - Vmin);
-        painter.drawLine(margin, y, W - margin, y);
-    }
-
-    QList<QPolygon> polys;
-
-    QList<int> channel_nums = vs_data.keys();
-    for (int j = 0; j < channel_nums.size(); j++)
-        polys.push_back(QPolygon());
-
-    for (int i = 0; i < ts_data.size(); i++)
-    {
-        int x = minx + (maxx - minx) * (ts_data[i] - Tmin) / (Tmax - Tmin);
-        for (int j = 0; j < channel_nums.size(); j++)
-        {
-            int ch = channel_nums[j];
-            if (vs_data[ch].size() <= i)
-                continue;
-            int y = maxy - (maxy - miny) * (vs_data[ch][i] - Vmin) / (Vmax - Vmin);
-            polys[j].push_back(QPoint(x, y));
-        }
-    }
-
-    for (int j = 0; j < channel_nums.size(); j++)
-    {
-        int ch = channel_nums[j];
-        painter.setPen(QPen(channels_color[ch], 1));
-        painter.drawPolyline(polys[j]);
-    }
-
-    painter.end();
-
-    ui->lPlot->setPixmap(QPixmap::fromImage(plot));
-    ui->lPlot->repaint();
 
     redraw_needed = false;
 }
@@ -399,10 +199,14 @@ void MainWindow::updateData(int packet_num, int freq_code, const QList<int> &cha
     redraw_needed = (samples.size() > 0);
 }
 
-void MainWindow::parseADCPacket(const unsigned char *packet)
+void MainWindow::parseADCPacket(const QByteArray &packet)
 {
-    ADCPacketHeader * header = (ADCPacketHeader*)packet;
-    uint8_t * data = (uint8_t*)packet + sizeof(ADCPacketHeader);
+    if (packet.size() < (int)ADC_PACKET_SIZE)
+        return;
+
+    const unsigned char *raw_packet = reinterpret_cast<const unsigned char*>(packet.constData());
+    const ADCPacketHeader * header = reinterpret_cast<const ADCPacketHeader*>(raw_packet);
+    const uint8_t * data = raw_packet + sizeof(ADCPacketHeader);
     int length = ADC_PACKET_SIZE - sizeof(ADCPacketHeader);
 
     int lost = 0;
@@ -468,47 +272,23 @@ void MainWindow::parseADCPacket(const unsigned char *packet)
     updateStatistics(ADC_PACKET_SIZE, 1, samples.size(), samples.size() / channels.size(), lost);
 }
 
+void MainWindow::onAdcPacket(const QByteArray &packet)
+{
+    parseADCPacket(packet);
+}
+
 int32_t MainWindow::readRegister(int reg_index0, int nbytes, int tries)
 {
-    if (!current_adc)
+    if (!usb_manager)
         return 0;
-    uint32_t reg_value = 0;
-    for (int i = 0; i < nbytes; i++)
-    {
-        uint8_t value = 0;
-        int index = reg_index0 + i;
-        for (int ntry = 0; ntry < tries; ntry++)
-        {
-            int res = libusb_control_transfer(current_adc, 0x80|0x40, ADC_REQUEST_SETUP, 0, index, (unsigned char*)&value, 1, TRANSFER_TIMEOUT_MS);
-            if (res < 0)
-                qDebug("[%d/%d] [index = %d+%d] libusb_control_transfer() => %d", ntry+1, tries, reg_index0, i, res);
-            else
-            {
-                reg_value |= ((uint32_t)value << (i*8));
-                break;
-            }
-        }
-    }
-    return (int32_t)reg_value;
+    return usb_manager->readRegister(reg_index0, nbytes, tries);
 }
 
 void MainWindow::writeRegister(int reg_index0, int32_t reg_value, int nbytes, int tries)
 {
-    if (!current_adc)
+    if (!usb_manager)
         return;
-    for (int i = 0; i < nbytes; i++)
-    {
-        int index = reg_index0 + i;
-        uint8_t value = (reg_value >> (i*8)) & 0xff;
-        for (int ntry = 0; ntry < tries; ntry++)
-        {
-            int res = libusb_control_transfer(current_adc, 0x40, ADC_REQUEST_SETUP, value, index, NULL, 0, TRANSFER_TIMEOUT_MS);
-            if (res < 0)
-                qDebug("[%d/%d] [index = %d+%d, value = 0x%02x] libusb_control_transfer() => %d", ntry+1, tries, reg_index0, i, value, res);
-            else
-                break;
-        }
-    }
+    usb_manager->writeRegister(reg_index0, reg_value, nbytes, tries);
 }
 
 void MainWindow::readConfig()
@@ -555,12 +335,16 @@ void MainWindow::readConfig()
     ui->dsbTrigTMax->setValue(dt * (double)readRegister(ADC_INDEX_TRIG_T_MAX, 4));
 }
 
-MainWindow::MainWindow(libusb_context *ctx0, QWidget *parent) :
+MainWindow::MainWindow(AdcUsbManager *manager, QWidget *parent) :
     QMainWindow(parent),
-    ctx(ctx0),
-    current_adc(NULL),
-    restart_transfers(false),
+    usb_manager(manager),
     last_seq(-1),
+    seq_t0(0),
+    bytes_received(0),
+    packets_received(0),
+    samples_received(0),
+    periods_received(0),
+    packets_lost(0),
     channels_in_use(0),
     redraw_needed(true),
     ui(new Ui::MainWindow)
@@ -569,6 +353,16 @@ MainWindow::MainWindow(libusb_context *ctx0, QWidget *parent) :
 
     connect(&event_timer, SIGNAL(timeout()), this, SLOT(handleUsbEvents()));
     connect(ui->menuDevice, SIGNAL(triggered(QAction*)), this, SLOT(deviceSelected(QAction*)));
+
+    if (usb_manager)
+    {
+        connect(usb_manager, &AdcUsbManager::packetReceived,
+                this, &MainWindow::onAdcPacket);
+        connect(usb_manager, &AdcUsbManager::transferTimedOut,
+                this, [this]() { redrawSamples(); });
+        connect(usb_manager, &AdcUsbManager::usbError,
+                this, &MainWindow::onUsbError);
+    }
 
     QGridLayout * grid = new QGridLayout();
     for (int nch = 0; nch < ADC_TOTAL_CHANNELS; nch++)
@@ -598,40 +392,16 @@ MainWindow::MainWindow(libusb_context *ctx0, QWidget *parent) :
 
 MainWindow::~MainWindow()
 {
-    setCurrentADC(NULL);
-    libusb_exit(ctx);
+    if (usb_manager)
+        usb_manager->closeDevice();
     delete ui;
-}
-
-void MainWindow::onTransfer(libusb_transfer *transfer)
-{
-    if (transfer->status != LIBUSB_TRANSFER_COMPLETED && transfer->status != LIBUSB_TRANSFER_TIMED_OUT)
-    {
-        qDebug("transfer 0x%08llx not completed, status = %d", (qulonglong)transfer, transfer->status);
-    }
-    else
-    {
-        for (int i = 0; i + (int)ADC_PACKET_SIZE <= transfer->actual_length; i += ADC_PACKET_SIZE)
-            parseADCPacket(transfer->buffer + i);
-        if (transfer->status == LIBUSB_TRANSFER_TIMED_OUT)
-            redrawSamples();
-    }
-    if (!restart_transfers)
-        return;
-
-    int res = libusb_submit_transfer(transfer);
-    if (res != 0)
-        qDebug("Can't submit transfer 0x%08llx, code = %d", (qulonglong)transfer, res);
 }
 
 void MainWindow::handleUsbEvents(int timeout_ms)
 {
-    struct timeval tv;
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-    int res = libusb_handle_events_timeout(ctx, &tv);
-    if (res != 0)
-        qDebug("libusb_handle_events() returns error code %d", res);
+    if (!usb_manager)
+        return;
+    usb_manager->handleUsbEvents(timeout_ms);
 }
 
 void MainWindow::clearDevicesList()
@@ -643,7 +413,8 @@ void MainWindow::clearDevicesList()
             libusb_unref_device(dev);
     }
     ui->menuDevice->clear();
-    ui->menuDevice->addAction(tr("Refresh list"));
+    QAction *refreshAction = ui->menuDevice->addAction(tr("Refresh list"));
+    refreshAction->setData((qulonglong)0);
     ui->menuDevice->addSeparator();
 }
 
@@ -651,39 +422,52 @@ void MainWindow::refreshDevicesList()
 {
     clearDevicesList();
 
-    libusb_device **list = NULL;
-    ssize_t count = libusb_get_device_list(ctx, &list);
+    if (!usb_manager)
+        return;
+
     int adcs_added = 0;
-    for (int i = 0; i < count; i++)
+    QList<libusb_device*> devices = usb_manager->enumerateDevices();
+    for (libusb_device *device : devices)
     {
-        struct libusb_device_descriptor desc;
-        libusb_get_device_descriptor(list[i], &desc);
-        if (desc.idVendor == ADC_ID_VENDOR && desc.idProduct == ADC_ID_PRODUCT)
-        {
-            QString name = tr("bus = %1, port = %2, address = %3")
-                    .arg(libusb_get_bus_number(list[i]))
-                    .arg(libusb_get_port_number(list[i]))
-                    .arg(libusb_get_device_address(list[i]));
-            QAction *act = ui->menuDevice->addAction(name);
-            act->setData((qulonglong)list[i]);
-            adcs_added++;
-        }
-        else
-            libusb_unref_device(list[i]);
+        QString name = tr("bus = %1, port = %2, address = %3")
+                .arg(libusb_get_bus_number(device))
+                .arg(libusb_get_port_number(device))
+                .arg(libusb_get_device_address(device));
+        QAction *act = ui->menuDevice->addAction(name);
+        act->setData((qulonglong)device);
+        adcs_added++;
     }
-    libusb_free_device_list(list, 0);
 
     if (adcs_added == 1)
         deviceSelected(ui->menuDevice->actions().last());
+    else if (adcs_added == 0)
+        ui->statusBar->showMessage(tr("disconnected"));
 }
 
 void MainWindow::deviceSelected(QAction *action)
 {
+    if (!usb_manager)
+        return;
+
     libusb_device * dev = (libusb_device*)action->data().toULongLong();
     if (!dev)
         refreshDevicesList();
     else
-        setCurrentADC(dev);
+    {
+        if (usb_manager->openDevice(dev))
+        {
+            resetStatistics();
+            readConfig();
+            ui->statusBar->showMessage(tr("connected"));
+        }
+        else
+            ui->statusBar->showMessage(tr("connection failed"));
+    }
+}
+
+void MainWindow::onUsbError(const QString &message)
+{
+    ui->statusBar->showMessage(message);
 }
 
 void MainWindow::updateChannelsSelection()
