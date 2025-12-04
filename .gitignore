@@ -1,7 +1,7 @@
 obj
 *.elf
 *.bin
-#*.hex
+*.hex
 *.log
 build
 *.txt

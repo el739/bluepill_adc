@@ -26,9 +26,14 @@ DEFINES += QT_DEPRECATED_WARNINGS
 
 
 SOURCES += main.cpp\
-        mainwindow.cpp
+        mainwindow.cpp \
+        adc_usb_manager.cpp \
+        plotrenderer.cpp
 
 HEADERS  += mainwindow.h \
-    adc_proto.h
+    adc_proto.h \
+    adc_usb_manager.h \
+    plotrenderer.h
 
 FORMS    += mainwindow.ui
+CONFIG += console
